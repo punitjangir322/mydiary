@@ -116,9 +116,7 @@ button.signup-btn:hover{background:#38a169;}
 <div class="login-card">
     <h2>📔 Personal Diary</h2>
     
-    <div class="info-box">
-        <strong>Admin Login:</strong> admin / admin123
-    </div>
+    
     
     {% if message %}
     <div class="message {{message_type}}">{{message}}</div>
