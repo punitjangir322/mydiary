@@ -1,0 +1,12 @@
+# Database
+*.db
+*.db-journal
+
+# Uploads
+uploads/
+__pycache__/
+*.pyc
+.env
+.vercel
+.vscode/
+.idea/
