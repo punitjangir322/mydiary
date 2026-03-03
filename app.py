@@ -1,18 +1,42 @@
-from flask import Flask, render_template_string, request, redirect, session, send_from_directory, g, url_for
-import sqlite3, os, uuid
+from flask import Flask, render_template_string, request, redirect, session, send_from_directory, g
+import sqlite3
+import os
+import uuid
+import random
+import smtplib
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from datetime import datetime
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+import os
+from email.mime.multipart import MIMEMultipart
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'supersecretkey123!@#')
 
-# Railway environment
-DATABASE = "diary.db"
-UPLOAD_FOLDER = "uploads"
+# Configuration for email
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = 'punitjangir322@gmail.com'
+app.config['MAIL_PASSWORD'] = 'sghv tcsj omrp wuum'  # Your app password
 
-# Create directories
+# Railway environment - Use persistent volume for database
+# Railway provides /data directory for persistent storage
+DATABASE = os.path.join('/data', 'diary.db') if os.path.exists('/data') else 'diary.db'
+UPLOAD_FOLDER = os.path.join('/data', 'uploads') if os.path.exists('/data') else 'uploads'
+
+# Create directories with proper permissions
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(os.path.dirname(DATABASE) if os.path.dirname(DATABASE) else '.', exist_ok=True)
+
+# Store OTPs temporarily
+otp_storage = {}
 
 # ---------------- DATABASE CONNECTION ----------------
 
@@ -29,22 +53,27 @@ def close_db(exception):
     if db is not None:
         db.close()
 
-# ---------------- INIT DATABASE ----------------
+# ---------------- INIT DATABASE (WITHOUT OVERWRITING) ----------------
 
 def init_db():
-    """Initialize database with tables and admin user"""
+    """Initialize database only if it doesn't exist - won't overwrite existing data"""
+    db_exists = os.path.exists(DATABASE)
     db = sqlite3.connect(DATABASE)
     db.execute("PRAGMA foreign_keys = ON")
     
     # Check if tables exist
     cursor = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
-    if not cursor.fetchone():
+    tables_exist = cursor.fetchone() is not None
+    
+    if not tables_exist:
+        print("Creating new database tables...")
         # Create tables
         db.executescript("""
         CREATE TABLE users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
+            email TEXT UNIQUE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -66,15 +95,80 @@ def init_db():
         );
         """)
 
-        # Create admin user
-        db.execute("INSERT INTO users (username,password) VALUES (?,?)",
-                   ("admin", generate_password_hash("admin123")))
+        # Create admin user only if no users exist
+        admin_exists = db.execute("SELECT * FROM users WHERE username = 'admin'").fetchone()
+        if not admin_exists:
+            db.execute("INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
+                       ("admin", generate_password_hash("admin123"), "admin@diary.com"))
+        
+        # Create test user only if no test user exists
+        test_exists = db.execute("SELECT * FROM users WHERE username = 'test'").fetchone()
+        if not test_exists:
+            db.execute("INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
+                       ("test", generate_password_hash("test123"), "test@example.com"))
+        
         db.commit()
+        print("Database initialized successfully!")
+    else:
+        print("Database already exists, skipping initialization...")
+        
+        # Check if admin exists, if not create it
+        admin_exists = db.execute("SELECT * FROM users WHERE username = 'admin'").fetchone()
+        if not admin_exists:
+            print("Admin user not found, creating...")
+            db.execute("INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
+                       ("admin", generate_password_hash("admin123"), "admin@diary.com"))
+            db.commit()
+        
+        # Check if test user exists, if not create it
+        test_exists = db.execute("SELECT * FROM users WHERE username = 'test'").fetchone()
+        if not test_exists:
+            print("Test user not found, creating...")
+            db.execute("INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
+                       ("test", generate_password_hash("test123"), "test@example.com"))
+            db.commit()
     
     db.close()
 
 # Initialize database
 init_db()
+
+# ---------------- EMAIL SENDING FUNCTION ----------------
+
+def send_otp_email(to_email, otp):
+    """Send OTP via email"""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = app.config['MAIL_USERNAME']
+        msg['To'] = to_email
+        msg['Subject'] = "Password Reset OTP - Personal Diary"
+        
+        body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2 style="color: #667eea;">Personal Diary - Password Reset</h2>
+            <p>Your OTP for password reset is:</p>
+            <h1 style="color: #48bb78; font-size: 32px; letter-spacing: 5px;">{otp}</h1>
+            <p>This OTP is valid for 10 minutes.</p>
+            <p>If you didn't request this, please ignore this email.</p>
+            <hr>
+            <p style="color: #666; font-size: 12px;">Personal Diary App</p>
+        </body>
+        </html>
+        """
+        
+        msg.attach(MIMEText(body, 'html'))
+        
+        server = smtplib.SMTP(app.config['MAIL_SERVER'], app.config['MAIL_PORT'])
+        server.starttls()
+        server.login(app.config['MAIL_USERNAME'], app.config['MAIL_PASSWORD'])
+        server.send_message(msg)
+        server.quit()
+        
+        return True
+    except Exception as e:
+        print(f"Email error: {e}")
+        return False
 
 # ---------------- LOGIN PAGE TEMPLATE ----------------
 
@@ -102,6 +196,7 @@ button{width:100%;padding:14px;background:#667eea;color:white;border:none;border
 button:hover{background:#5a67d8;transform:translateY(-2px);box-shadow:0 5px 15px rgba(102,126,234,0.4);}
 button.signup-btn{background:#48bb78;}
 button.signup-btn:hover{background:#38a169;}
+button.forgot-btn{background:#f6ad55;margin-top:10px;}
 .message{padding:12px;border-radius:8px;margin-bottom:20px;text-align:center;}
 .success{background:#c6f6d5;color:#22543d;border:1px solid #9ae6b4;}
 .error{background:#fed7d7;color:#742a2a;border:1px solid #feb2b2;}
@@ -110,6 +205,9 @@ button.signup-btn:hover{background:#38a169;}
 .switch-text span:hover{text-decoration:underline;}
 .info-box{background:#e6f7ff;border:1px solid #91d5ff;padding:10px;border-radius:8px;margin-bottom:20px;text-align:center;color:#0050b3;}
 .info-box strong{color:#1890ff;}
+.forgot-link{text-align:center;margin-top:15px;}
+.forgot-link a{color:#667eea;text-decoration:none;font-size:14px;}
+.forgot-link a:hover{text-decoration:underline;}
 
 /* Mobile Responsive */
 @media(max-width:480px){
@@ -147,6 +245,9 @@ button.signup-btn:hover{background:#38a169;}
             </div>
             <button type="submit">Login</button>
         </form>
+        <div class="forgot-link">
+            <a href="/forgot-password">Forgot Password?</a>
+        </div>
         <div class="switch-text">
             Don't have an account? <span onclick="showSignup()">Sign up here</span>
         </div>
@@ -157,6 +258,10 @@ button.signup-btn:hover{background:#38a169;}
             <div class="form-group">
                 <label>Username</label>
                 <input type="text" name="username" required autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" name="email" required placeholder="your@email.com">
             </div>
             <div class="form-group">
                 <label>Password</label>
@@ -189,7 +294,384 @@ function showSignup() {
 </html>
 """
 
-# ---------------- ADMIN PANEL PAGE WITH SEARCH ----------------
+# ---------------- FORGOT PASSWORD PAGE ----------------
+
+FORGOT_PASSWORD_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Forgot Password</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Poppins', sans-serif;
+}
+
+body {
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+
+.card {
+    background: white;
+    border-radius: 20px;
+    padding: 40px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+    max-width: 400px;
+    width: 100%;
+}
+
+.card h2 {
+    color: #333;
+    margin-bottom: 10px;
+    font-size: 24px;
+    text-align: center;
+}
+
+.card p {
+    color: #666;
+    margin-bottom: 30px;
+    text-align: center;
+    font-size: 14px;
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+label {
+    display: block;
+    margin-bottom: 8px;
+    color: #555;
+    font-weight: 500;
+    font-size: 14px;
+}
+
+input {
+    width: 100%;
+    padding: 12px;
+    border: 2px solid #e0e0e0;
+    border-radius: 10px;
+    font-size: 14px;
+    transition: all 0.3s;
+}
+
+input:focus {
+    outline: none;
+    border-color: #667eea;
+}
+
+button {
+    width: 100%;
+    padding: 14px;
+    background: #667eea;
+    color: white;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s;
+    margin-bottom: 10px;
+}
+
+button:hover {
+    background: #5a67d8;
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(102,126,234,0.4);
+}
+
+button.secondary {
+    background: #48bb78;
+}
+
+button.secondary:hover {
+    background: #38a169;
+}
+
+.back-link {
+    text-align: center;
+    margin-top: 20px;
+}
+
+.back-link a {
+    color: #667eea;
+    text-decoration: none;
+    font-size: 14px;
+}
+
+.back-link a:hover {
+    text-decoration: underline;
+}
+
+.message {
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    text-align: center;
+}
+
+.success {
+    background: #c6f6d5;
+    color: #22543d;
+    border: 1px solid #9ae6b4;
+}
+
+.error {
+    background: #fed7d7;
+    color: #742a2a;
+    border: 1px solid #feb2b2;
+}
+
+.otp-input {
+    letter-spacing: 8px;
+    font-size: 20px;
+    text-align: center;
+}
+
+.timer {
+    text-align: center;
+    color: #666;
+    font-size: 14px;
+    margin-top: 10px;
+}
+</style>
+</head>
+<body>
+
+<div class="card">
+    <h2>{% if step == 'email' %}🔐 Forgot Password{% elif step == 'otp' %}📨 Enter OTP{% else %}🔄 Reset Password{% endif %}</h2>
+    
+    {% if message %}
+    <div class="message {{message_type}}">{{message}}</div>
+    {% endif %}
+    
+    {% if step == 'email' %}
+    <p>Enter your email address to receive OTP</p>
+    <form method="post" action="/forgot-password">
+        <div class="form-group">
+            <label>Email Address</label>
+            <input type="email" name="email" required placeholder="your@email.com">
+        </div>
+        <button type="submit">Send OTP</button>
+        <div class="back-link">
+            <a href="/">← Back to Login</a>
+        </div>
+    </form>
+    
+    {% elif step == 'otp' %}
+    <p>Enter the 6-digit OTP sent to {{email}}</p>
+    <form method="post" action="/verify-otp">
+        <input type="hidden" name="email" value="{{email}}">
+        <div class="form-group">
+            <label>OTP</label>
+            <input type="text" name="otp" class="otp-input" maxlength="6" pattern="\\d{6}" required placeholder="------">
+        </div>
+        <button type="submit">Verify OTP</button>
+        <button type="submit" formaction="/resend-otp" class="secondary">Resend OTP</button>
+        <div class="back-link">
+            <a href="/">← Back to Login</a>
+        </div>
+    </form>
+    
+    {% elif step == 'reset' %}
+    <p>Create new password for {{email}}</p>
+    <form method="post" action="/reset-password">
+        <input type="hidden" name="email" value="{{email}}">
+        <div class="form-group">
+            <label>New Password</label>
+            <input type="password" name="password" required minlength="4" placeholder="••••••••">
+        </div>
+        <div class="form-group">
+            <label>Confirm Password</label>
+            <input type="password" name="confirm_password" required minlength="4" placeholder="••••••••">
+        </div>
+        <button type="submit">Reset Password</button>
+        <div class="back-link">
+            <a href="/">← Back to Login</a>
+        </div>
+    </form>
+    {% endif %}
+</div>
+
+</body>
+</html>
+"""
+
+# ---------------- CHANGE PASSWORD PAGE ----------------
+
+CHANGE_PASSWORD_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Change Password</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Poppins', sans-serif;
+}
+
+body {
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    min-height: 100vh;
+    padding: 20px;
+}
+
+.header {
+    background: rgba(0, 0, 0, 0.7);
+    color: white;
+    padding: 15px 20px;
+    border-radius: 15px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+
+.back-btn {
+    background: #667eea;
+    color: white;
+    padding: 8px 15px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    text-decoration: none;
+    font-size: 14px;
+}
+
+.header h3 {
+    font-size: 18px;
+    flex: 1;
+}
+
+.form-container {
+    background: white;
+    border-radius: 15px;
+    padding: 30px;
+    max-width: 400px;
+    margin: 0 auto;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+}
+
+.form-container h2 {
+    color: #333;
+    margin-bottom: 20px;
+    font-size: 22px;
+    text-align: center;
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+label {
+    display: block;
+    margin-bottom: 8px;
+    color: #555;
+    font-weight: 500;
+}
+
+input {
+    width: 100%;
+    padding: 12px;
+    border: 2px solid #e0e0e0;
+    border-radius: 10px;
+    font-size: 14px;
+}
+
+input:focus {
+    outline: none;
+    border-color: #667eea;
+}
+
+button {
+    width: 100%;
+    padding: 14px;
+    background: #667eea;
+    color: white;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s;
+    margin-top: 10px;
+}
+
+button:hover {
+    background: #5a67d8;
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(102,126,234,0.4);
+}
+
+.message {
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    text-align: center;
+}
+
+.success {
+    background: #c6f6d5;
+    color: #22543d;
+    border: 1px solid #9ae6b4;
+}
+
+.error {
+    background: #fed7d7;
+    color: #742a2a;
+    border: 1px solid #feb2b2;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+    <a href="/entries" class="back-btn">← Back</a>
+    <h3>🔐 Change Password</h3>
+</div>
+
+<div class="form-container">
+    <h2>Change Your Password</h2>
+    
+    {% if message %}
+    <div class="message {{message_type}}">{{message}}</div>
+    {% endif %}
+    
+    <form method="post" action="/change-password">
+        <div class="form-group">
+            <label>Current Password</label>
+            <input type="password" name="current_password" required placeholder="••••••••">
+        </div>
+        <div class="form-group">
+            <label>New Password</label>
+            <input type="password" name="new_password" required minlength="4" placeholder="••••••••">
+        </div>
+        <div class="form-group">
+            <label>Confirm New Password</label>
+            <input type="password" name="confirm_password" required minlength="4" placeholder="••••••••">
+        </div>
+        <button type="submit">Update Password</button>
+    </form>
+</div>
+
+</body>
+</html>
+"""
+
+# ---------------- ADMIN PANEL PAGE ----------------
 
 ADMIN_PANEL_PAGE = """
 <!DOCTYPE html>
@@ -368,6 +850,7 @@ body {
     display: flex;
     align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .user-badge {
@@ -379,11 +862,18 @@ body {
     font-weight: 600;
 }
 
+.user-email {
+    font-size: 12px;
+    opacity: 0.8;
+    margin-bottom: 4px;
+}
+
 .user-meta {
     display: flex;
     gap: 15px;
     font-size: 12px;
     opacity: 0.8;
+    flex-wrap: wrap;
 }
 
 .user-meta span {
@@ -392,13 +882,19 @@ body {
     gap: 4px;
 }
 
+.action-buttons {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
 .login-btn {
     background: #667eea;
     color: white;
-    padding: 8px 15px;
+    padding: 8px 12px;
     border: none;
     border-radius: 8px;
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 500;
     cursor: pointer;
     text-decoration: none;
@@ -410,7 +906,26 @@ body {
 
 .login-btn:hover {
     background: #5a67d8;
-    transform: translateY(-1px);
+}
+
+.delete-btn {
+    background: #f56565;
+    color: white;
+    padding: 8px 12px;
+    border: none;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+}
+
+.delete-btn:hover {
+    background: #e53e3e;
 }
 
 .empty-state {
@@ -475,49 +990,89 @@ body {
     box-shadow: 0 4px 10px rgba(0,0,0,0.2);
 }
 
-/* Loading indicator */
-.loading {
-    text-align: center;
+/* Delete Confirmation Modal */
+.modal {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.5);
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background: white;
     padding: 30px;
+    border-radius: 20px;
+    max-width: 300px;
+    text-align: center;
+}
+
+.modal-content h3 {
+    color: #333;
+    margin-bottom: 10px;
+}
+
+.modal-content p {
+    color: #666;
+    margin-bottom: 20px;
+}
+
+.modal-buttons {
+    display: flex;
+    gap: 10px;
+}
+
+.modal-btn {
+    flex: 1;
+    padding: 12px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.confirm-btn {
+    background: #f56565;
     color: white;
 }
 
-.loading::after {
-    content: '';
-    display: inline-block;
-    width: 20px;
-    height: 20px;
-    border: 3px solid rgba(255,255,255,0.3);
-    border-top-color: white;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    margin-left: 10px;
-}
-
-@keyframes spin {
-    to { transform: rotate(360deg); }
+.cancel-btn {
+    background: #e0e0e0;
+    color: #333;
 }
 
 /* Mobile Responsive */
-@media(max-width: 480px) {
-    .user-meta {
-        flex-direction: column;
-        gap: 5px;
-    }
-    
+@media(max-width: 768px) {
     .user-card {
         flex-direction: column;
         align-items: flex-start;
         gap: 10px;
     }
     
-    .login-btn {
+    .action-buttons {
         width: 100%;
+    }
+    
+    .login-btn, .delete-btn {
+        flex: 1;
+        text-align: center;
         justify-content: center;
     }
     
     .stats-grid {
         grid-template-columns: 1fr 1fr;
+    }
+}
+
+@media(max-width: 480px) {
+    .user-meta {
+        flex-direction: column;
+        gap: 5px;
     }
 }
 </style>
@@ -564,29 +1119,37 @@ body {
     </div>
     
     <div class="search-container">
-        <input type="text" id="searchInput" class="search-box" placeholder="🔍 Search by username..." onkeyup="filterUsers()">
+        <input type="text" id="searchInput" class="search-box" placeholder="🔍 Search by username or email..." onkeyup="filterUsers()">
     </div>
     
     <div id="usersList">
         {% if users %}
             {% for u in users %}
-            <div class="user-card" data-username="{{u.username|lower}}">
+            <div class="user-card" data-username="{{u.username|lower}}" data-email="{{u.email|lower}}">
                 <div class="user-info">
                     <div class="user-name">
                         {{u.username}}
-                        {% if u.entry_count %}
+                        {% if u.entry_count > 0 %}
                         <span class="user-badge">{{u.entry_count}} entries</span>
                         {% endif %}
                     </div>
+                    {% if u.email %}
+                    <div class="user-email">📧 {{u.email}}</div>
+                    {% endif %}
                     <div class="user-meta">
                         <span>📝 {{u.entry_count}} entries</span>
                         <span>📸 {{u.photo_count}} photos</span>
                         <span>📅 Joined: {{u.created_at[:10]}}</span>
                     </div>
                 </div>
-                <a href="/admin_login/{{u.id}}" class="login-btn">
-                    🔑 Login as {{u.username}}
-                </a>
+                <div class="action-buttons">
+                    <a href="/admin_login/{{u.id}}" class="login-btn">
+                        🔑 Login
+                    </a>
+                    <button onclick="showDeleteModal({{u.id}}, '{{u.username}}')" class="delete-btn">
+                        🗑️ Delete
+                    </button>
+                </div>
             </div>
             {% endfor %}
         {% else %}
@@ -607,7 +1170,21 @@ body {
     <a href="/entries" class="nav-btn secondary">📋 My Diary</a>
 </div>
 
+<!-- Delete Confirmation Modal -->
+<div id="deleteModal" class="modal">
+    <div class="modal-content">
+        <h3>🗑️ Delete User</h3>
+        <p id="deleteMessage">Are you sure you want to delete this user? This will delete all their entries and photos.</p>
+        <div class="modal-buttons">
+            <button onclick="confirmDelete()" class="modal-btn confirm-btn">Yes, Delete</button>
+            <button onclick="hideDeleteModal()" class="modal-btn cancel-btn">Cancel</button>
+        </div>
+    </div>
+</div>
+
 <script>
+let deleteUserId = null;
+
 function filterUsers() {
     const searchInput = document.getElementById('searchInput').value.toLowerCase();
     const userCards = document.querySelectorAll('.user-card');
@@ -615,7 +1192,8 @@ function filterUsers() {
     
     userCards.forEach(card => {
         const username = card.getAttribute('data-username');
-        if (username.includes(searchInput)) {
+        const email = card.getAttribute('data-email') || '';
+        if (username.includes(searchInput) || email.includes(searchInput)) {
             card.style.display = 'flex';
             visibleCount++;
         } else {
@@ -631,6 +1209,23 @@ function filterUsers() {
     }
 }
 
+function showDeleteModal(userId, username) {
+    deleteUserId = userId;
+    document.getElementById('deleteMessage').innerHTML = `Are you sure you want to delete user <strong>${username}</strong>? This will delete all their entries and photos.`;
+    document.getElementById('deleteModal').style.display = 'flex';
+}
+
+function hideDeleteModal() {
+    document.getElementById('deleteModal').style.display = 'none';
+    deleteUserId = null;
+}
+
+function confirmDelete() {
+    if (deleteUserId) {
+        window.location.href = '/admin_delete/' + deleteUserId;
+    }
+}
+
 // Live search as you type
 document.getElementById('searchInput').addEventListener('keyup', filterUsers);
 </script>
@@ -639,7 +1234,7 @@ document.getElementById('searchInput').addEventListener('keyup', filterUsers);
 </html>
 """
 
-# ---------------- ENTRIES LIST PAGE (for normal users) ----------------
+# ---------------- ENTRIES LIST PAGE ----------------
 
 ENTRIES_PAGE = """
 <!DOCTYPE html>
@@ -689,8 +1284,25 @@ body {
     font-weight: 600;
 }
 
+.header-buttons {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
 .logout-btn {
     background: #f56565;
+    color: white;
+    padding: 8px 15px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    text-decoration: none;
+    font-size: 14px;
+}
+
+.change-password-btn {
+    background: #f6ad55;
     color: white;
     padding: 8px 15px;
     border: none;
@@ -822,20 +1434,37 @@ body {
     cursor: pointer;
     text-decoration: none;
     font-size: 14px;
-    margin-left: 10px;
+}
+
+/* Mobile Responsive */
+@media(max-width: 480px) {
+    .header {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    
+    .header-buttons {
+        width: 100%;
+    }
+    
+    .change-password-btn, .logout-btn, .admin-link {
+        flex: 1;
+        text-align: center;
+    }
 }
 </style>
 </head>
 <body>
 
 <div class="header">
-    <div style="display: flex; align-items: center; gap: 10px;">
+    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
         <h3>📔 {{session['user']}}'s Diary</h3>
         {% if session.get('is_admin') %}
         <span class="user-badge">Admin</span>
         {% endif %}
     </div>
-    <div>
+    <div class="header-buttons">
+        <a href="/change-password" class="change-password-btn">🔐 Change Password</a>
         {% if session.get('is_admin') %}
         <a href="/admin" class="admin-link">👑 Admin Panel</a>
         {% endif %}
@@ -1371,7 +2000,7 @@ small {
 </html>
 """
 
-# ---------------- VIEW ENTRY PAGE WITH EDIT & DELETE ----------------
+# ---------------- VIEW ENTRY PAGE ----------------
 
 VIEW_ENTRY_PAGE = """
 <!DOCTYPE html>
@@ -1808,6 +2437,119 @@ body {
 </html>
 """
 
+# ---------------- DATABASE STATUS PAGE ----------------
+
+@app.route("/db-status")
+def db_status():
+    """Check database status (only for admin)"""
+    if not session.get("is_admin"):
+        return "Unauthorized", 403
+    
+    db = get_db()
+    
+    # Get database info
+    db_path = DATABASE
+    db_exists = os.path.exists(db_path)
+    db_size = os.path.getsize(db_path) if db_exists else 0
+    
+    # Get user counts
+    user_count = db.execute("SELECT COUNT(*) as count FROM users").fetchone()['count']
+    entry_count = db.execute("SELECT COUNT(*) as count FROM entries").fetchone()['count']
+    photo_count = db.execute("SELECT COUNT(*) as count FROM photos").fetchone()['count']
+    
+    # Get upload folder info
+    upload_files = len(os.listdir(UPLOAD_FOLDER)) if os.path.exists(UPLOAD_FOLDER) else 0
+    upload_size = sum(os.path.getsize(os.path.join(UPLOAD_FOLDER, f)) for f in os.listdir(UPLOAD_FOLDER) if os.path.isfile(os.path.join(UPLOAD_FOLDER, f))) if os.path.exists(UPLOAD_FOLDER) else 0
+    
+    # Convert to MB for readability
+    db_size_mb = db_size / (1024 * 1024)
+    upload_size_mb = upload_size / (1024 * 1024)
+    
+    status_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Database Status</title>
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet">
+        <style>
+            body {{
+                font-family: 'Poppins', sans-serif;
+                background: linear-gradient(135deg, #667eea, #764ba2);
+                padding: 20px;
+                color: white;
+            }}
+            .container {{
+                background: rgba(255,255,255,0.15);
+                backdrop-filter: blur(15px);
+                border-radius: 20px;
+                padding: 30px;
+                max-width: 800px;
+                margin: 0 auto;
+            }}
+            h1 {{ margin-bottom: 20px; }}
+            .stat-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin-bottom: 20px;
+            }}
+            .stat-card {{
+                background: rgba(255,255,255,0.2);
+                padding: 20px;
+                border-radius: 12px;
+            }}
+            .stat-value {{ font-size: 24px; font-weight: 600; }}
+            .stat-label {{ font-size: 14px; opacity: 0.8; }}
+            .info {{ margin-top: 20px; }}
+            .info-item {{ margin: 10px 0; }}
+            .back-btn {{
+                display: inline-block;
+                margin-top: 20px;
+                padding: 12px 24px;
+                background: #667eea;
+                color: white;
+                text-decoration: none;
+                border-radius: 10px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📊 Database Status</h1>
+            
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-value">{user_count}</div>
+                    <div class="stat-label">Total Users</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{entry_count}</div>
+                    <div class="stat-label">Total Entries</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{photo_count}</div>
+                    <div class="stat-label">Total Photos</div>
+                </div>
+            </div>
+            
+            <div class="info">
+                <h3>📁 Storage Info</h3>
+                <div class="info-item">📂 Database Path: {db_path}</div>
+                <div class="info-item">💾 Database Size: {db_size_mb:.2f} MB</div>
+                <div class="info-item">📸 Upload Folder: {UPLOAD_FOLDER}</div>
+                <div class="info-item">🖼️ Total Photos Files: {upload_files}</div>
+                <div class="info-item">📦 Photos Size: {upload_size_mb:.2f} MB</div>
+                <div class="info-item">✅ Database Persistent: {'Yes' if '/data' in db_path else 'No'}</div>
+            </div>
+            
+            <a href="/admin" class="back-btn">← Back to Admin</a>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return status_html
+
 # ---------------- ROUTES ----------------
 
 @app.route("/")
@@ -1843,7 +2585,6 @@ def admin_panel():
     total_photos = db.execute("SELECT COUNT(*) as count FROM photos").fetchone()['count']
     
     # New users today
-    today = datetime.now().strftime("%Y-%m-%d")
     new_users_today = db.execute("""
         SELECT COUNT(*) as count FROM users 
         WHERE date(created_at) = date('now') AND username != 'admin'
@@ -1855,6 +2596,22 @@ def admin_panel():
                                 total_entries=total_entries,
                                 total_photos=total_photos,
                                 new_users_today=new_users_today)
+
+@app.route("/admin_delete/<int:id>")
+def admin_delete(id):
+    if not session.get("user") or not session.get("is_admin"):
+        return redirect("/")
+    
+    db = get_db()
+    
+    try:
+        # Delete user (entries and photos will be deleted automatically due to CASCADE)
+        db.execute("DELETE FROM users WHERE id = ? AND username != 'admin'", (id,))
+        db.commit()
+    except Exception as e:
+        print(f"Error deleting user: {e}")
+    
+    return redirect("/admin")
 
 @app.route("/entries")
 def entries_list():
@@ -1878,10 +2635,11 @@ def entries_list():
 def signup():
     username = request.form["username"].strip()
     password = request.form["password"]
+    email = request.form.get("email", "").strip()
     
-    if not username or not password:
+    if not username or not password or not email:
         return render_template_string(LOGIN_TEMPLATE, 
-                                    message="Username and password required", 
+                                    message="All fields are required", 
                                     message_type="error",
                                     active_tab='signup')
     
@@ -1893,18 +2651,24 @@ def signup():
     
     db = get_db()
     try:
-        db.execute("INSERT INTO users (username, password) VALUES (?,?)",
-                   (username, generate_password_hash(password)))
+        db.execute("INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
+                   (username, generate_password_hash(password), email))
         db.commit()
         return render_template_string(LOGIN_TEMPLATE, 
                                     message="Account created! Please login.", 
                                     message_type="success",
                                     active_tab='login')
-    except sqlite3.IntegrityError:
-        return render_template_string(LOGIN_TEMPLATE, 
-                                    message="Username already exists", 
-                                    message_type="error",
-                                    active_tab='signup')
+    except sqlite3.IntegrityError as e:
+        if "username" in str(e):
+            return render_template_string(LOGIN_TEMPLATE, 
+                                        message="Username already exists", 
+                                        message_type="error",
+                                        active_tab='signup')
+        else:
+            return render_template_string(LOGIN_TEMPLATE, 
+                                        message="Email already registered", 
+                                        message_type="error",
+                                        active_tab='signup')
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -1951,8 +2715,201 @@ def admin_login(id):
     
     return redirect("/admin")
 
+@app.route("/change-password", methods=["GET", "POST"])
+def change_password():
+    if not session.get("user"):
+        return redirect("/")
+    
+    if request.method == "GET":
+        return render_template_string(CHANGE_PASSWORD_PAGE)
+    
+    # POST request
+    current_password = request.form["current_password"]
+    new_password = request.form["new_password"]
+    confirm_password = request.form["confirm_password"]
+    
+    if new_password != confirm_password:
+        return render_template_string(CHANGE_PASSWORD_PAGE,
+                                    message="New passwords do not match",
+                                    message_type="error")
+    
+    if len(new_password) < 4:
+        return render_template_string(CHANGE_PASSWORD_PAGE,
+                                    message="Password must be at least 4 characters",
+                                    message_type="error")
+    
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+    
+    if not check_password_hash(user["password"], current_password):
+        return render_template_string(CHANGE_PASSWORD_PAGE,
+                                    message="Current password is incorrect",
+                                    message_type="error")
+    
+    db.execute("UPDATE users SET password = ? WHERE id = ?",
+              (generate_password_hash(new_password), session["user_id"]))
+    db.commit()
+    
+    return render_template_string(CHANGE_PASSWORD_PAGE,
+                                message="Password changed successfully!",
+                                message_type="success")
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "GET":
+        return render_template_string(FORGOT_PASSWORD_PAGE, step='email')
+    
+    # POST request - send OTP
+    email = request.form["email"]
+    
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    
+    if not user:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='email',
+                                    message="Email not found in our records",
+                                    message_type="error")
+    
+    # Generate 6-digit OTP
+    otp = str(random.randint(100000, 999999))
+    
+    # Store OTP with timestamp (valid for 10 minutes)
+    otp_storage[email] = {
+        'otp': otp,
+        'timestamp': datetime.now(),
+        'user_id': user['id']
+    }
+    
+    # Send OTP via email
+    if send_otp_email(email, otp):
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='otp',
+                                    email=email,
+                                    message=f"OTP sent to {email}",
+                                    message_type="success")
+    else:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='email',
+                                    message="Failed to send OTP. Please try again.",
+                                    message_type="error")
+
+@app.route("/verify-otp", methods=["POST"])
+def verify_otp():
+    email = request.form["email"]
+    entered_otp = request.form["otp"]
+    
+    if email not in otp_storage:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='email',
+                                    message="OTP expired. Please request again.",
+                                    message_type="error")
+    
+    stored = otp_storage[email]
+    
+    # Check if OTP is expired (10 minutes)
+    if datetime.now() - stored['timestamp'] > timedelta(minutes=10):
+        del otp_storage[email]
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='email',
+                                    message="OTP expired. Please request again.",
+                                    message_type="error")
+    
+    if stored['otp'] == entered_otp:
+        # OTP verified, proceed to reset password
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='reset',
+                                    email=email,
+                                    message="OTP verified! Set your new password.",
+                                    message_type="success")
+    else:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='otp',
+                                    email=email,
+                                    message="Invalid OTP. Please try again.",
+                                    message_type="error")
+
+@app.route("/resend-otp", methods=["POST"])
+def resend_otp():
+    email = request.form["email"]
+    
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    
+    if not user:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='email',
+                                    message="Email not found",
+                                    message_type="error")
+    
+    # Generate new OTP
+    otp = str(random.randint(100000, 999999))
+    
+    # Update storage
+    otp_storage[email] = {
+        'otp': otp,
+        'timestamp': datetime.now(),
+        'user_id': user['id']
+    }
+    
+    # Send new OTP
+    if send_otp_email(email, otp):
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='otp',
+                                    email=email,
+                                    message="New OTP sent successfully!",
+                                    message_type="success")
+    else:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='otp',
+                                    email=email,
+                                    message="Failed to send OTP. Try again.",
+                                    message_type="error")
+
+@app.route("/reset-password", methods=["POST"])
+def reset_password():
+    email = request.form["email"]
+    new_password = request.form["password"]
+    confirm_password = request.form["confirm_password"]
+    
+    if new_password != confirm_password:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='reset',
+                                    email=email,
+                                    message="Passwords do not match",
+                                    message_type="error")
+    
+    if len(new_password) < 4:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='reset',
+                                    email=email,
+                                    message="Password must be at least 4 characters",
+                                    message_type="error")
+    
+    if email not in otp_storage:
+        return render_template_string(FORGOT_PASSWORD_PAGE,
+                                    step='email',
+                                    message="Session expired. Please try again.",
+                                    message_type="error")
+    
+    user_id = otp_storage[email]['user_id']
+    
+    db = get_db()
+    db.execute("UPDATE users SET password = ? WHERE id = ?",
+              (generate_password_hash(new_password), user_id))
+    db.commit()
+    
+    # Clear OTP
+    if email in otp_storage:
+        del otp_storage[email]
+    
+    return render_template_string(LOGIN_TEMPLATE,
+                                message="Password reset successful! Please login.",
+                                message_type="success",
+                                active_tab='login')
+
 @app.route("/new")
-def new():
+def new_entry():
     if not session.get("user"):
         return redirect("/")
     
@@ -1960,150 +2917,165 @@ def new():
     return render_template_string(NEW_ENTRY_PAGE, today=today)
 
 @app.route("/save", methods=["POST"])
-def save():
+def save_entry():
     if not session.get("user"):
         return redirect("/")
     
+    date = request.form["date"]
+    content = request.form["content"]
+    files = request.files.getlist("photos")
+    
+    if not date or not content:
+        return render_template_string(NEW_ENTRY_PAGE,
+                                    message="Date and content are required",
+                                    today=datetime.now().strftime("%Y-%m-%d"))
+    
     db = get_db()
     
-    try:
-        cur = db.execute("""
-            INSERT INTO entries (user_id, date, content) 
-            VALUES (?, ?, ?)
-        """, (session["user_id"], request.form["date"], request.form["content"]))
-        entry_id = cur.lastrowid
-        
-        files = request.files.getlist("photos")
-        saved_count = 0
-        
+    # Insert entry
+    cursor = db.execute(
+        "INSERT INTO entries (user_id, date, content) VALUES (?, ?, ?)",
+        (session["user_id"], date, content)
+    )
+    db.commit()
+    
+    entry_id = cursor.lastrowid
+    
+    # Save photos
+    if files:
         for file in files:
             if file and file.filename:
-                filename = str(uuid.uuid4()) + "_" + secure_filename(file.filename)
-                file.save(os.path.join(UPLOAD_FOLDER, filename))
-                db.execute("INSERT INTO photos (entry_id, filename) VALUES (?,?)",
-                          (entry_id, filename))
-                saved_count += 1
-        
+                # Generate unique filename
+                ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else 'jpg'
+                filename = f"{uuid.uuid4().hex}.{ext}"
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                file.save(filepath)
+                
+                db.execute(
+                    "INSERT INTO photos (entry_id, filename) VALUES (?, ?)",
+                    (entry_id, filename)
+                )
         db.commit()
-        
-        message = "Entry saved successfully!"
-        submessage = f"{saved_count} photo(s) uploaded"
-        
-        return render_template_string(SUCCESS_PAGE, 
-                                    message=message,
-                                    submessage=submessage,
-                                    entry_id=entry_id)
     
-    except Exception as e:
-        db.rollback()
-        return render_template_string(NEW_ENTRY_PAGE, 
-                                    today=datetime.now().strftime("%Y-%m-%d"),
-                                    message=f"Error: {str(e)}", 
-                                    message_type="error")
+    return render_template_string(SUCCESS_PAGE,
+                                message="Entry saved successfully!",
+                                submessage="Your diary entry has been saved.",
+                                entry_id=entry_id)
 
 @app.route("/view/<int:id>")
-def view(id):
+def view_entry(id):
     if not session.get("user"):
         return redirect("/")
     
     db = get_db()
     
-    entry = db.execute("""
-        SELECT * FROM entries 
-        WHERE id = ? AND user_id = ?
-    """, (id, session["user_id"])).fetchone()
+    # Get entry
+    entry = db.execute(
+        "SELECT * FROM entries WHERE id = ? AND user_id = ?",
+        (id, session["user_id"])
+    ).fetchone()
     
     if not entry:
         return redirect("/entries")
     
-    photos = db.execute("SELECT filename FROM photos WHERE entry_id = ?", (id,)).fetchall()
+    # Get photos for this entry
+    photos = db.execute(
+        "SELECT * FROM photos WHERE entry_id = ?",
+        (id,)
+    ).fetchall()
     
     return render_template_string(VIEW_ENTRY_PAGE, entry=entry, photos=photos)
 
 @app.route("/edit/<int:id>")
-def edit(id):
+def edit_entry(id):
     if not session.get("user"):
         return redirect("/")
     
     db = get_db()
     
-    entry = db.execute("""
-        SELECT * FROM entries 
-        WHERE id = ? AND user_id = ?
-    """, (id, session["user_id"])).fetchone()
+    # Get entry
+    entry = db.execute(
+        "SELECT * FROM entries WHERE id = ? AND user_id = ?",
+        (id, session["user_id"])
+    ).fetchone()
     
     if not entry:
         return redirect("/entries")
     
-    photos = db.execute("SELECT filename FROM photos WHERE entry_id = ?", (id,)).fetchall()
+    # Get photos
+    photos = db.execute(
+        "SELECT * FROM photos WHERE entry_id = ?",
+        (id,)
+    ).fetchall()
     
     return render_template_string(EDIT_ENTRY_PAGE, entry=entry, photos=photos)
 
 @app.route("/update/<int:id>", methods=["POST"])
-def update(id):
+def update_entry(id):
     if not session.get("user"):
         return redirect("/")
     
+    date = request.form["date"]
+    content = request.form["content"]
+    files = request.files.getlist("photos")
+    
     db = get_db()
     
-    try:
-        # Update entry
-        db.execute("""
-            UPDATE entries 
-            SET date = ?, content = ? 
-            WHERE id = ? AND user_id = ?
-        """, (request.form["date"], request.form["content"], id, session["user_id"]))
-        
-        # Save new photos
-        files = request.files.getlist("photos")
-        saved_count = 0
-        
+    # Check if entry exists and belongs to user
+    entry = db.execute(
+        "SELECT * FROM entries WHERE id = ? AND user_id = ?",
+        (id, session["user_id"])
+    ).fetchone()
+    
+    if not entry:
+        return redirect("/entries")
+    
+    # Update entry
+    db.execute(
+        "UPDATE entries SET date = ?, content = ? WHERE id = ?",
+        (date, content, id)
+    )
+    db.commit()
+    
+    # Save new photos if any
+    if files:
         for file in files:
             if file and file.filename:
-                filename = str(uuid.uuid4()) + "_" + secure_filename(file.filename)
-                file.save(os.path.join(UPLOAD_FOLDER, filename))
-                db.execute("INSERT INTO photos (entry_id, filename) VALUES (?,?)",
-                          (id, filename))
-                saved_count += 1
-        
+                ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else 'jpg'
+                filename = f"{uuid.uuid4().hex}.{ext}"
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                file.save(filepath)
+                
+                db.execute(
+                    "INSERT INTO photos (entry_id, filename) VALUES (?, ?)",
+                    (id, filename)
+                )
         db.commit()
-        
-        message = "Entry updated successfully!"
-        submessage = f"{saved_count} new photo(s) added"
-        
-        return render_template_string(SUCCESS_PAGE, 
-                                    message=message,
-                                    submessage=submessage,
-                                    entry_id=id)
     
-    except Exception as e:
-        db.rollback()
-        return render_template_string(EDIT_ENTRY_PAGE,
-                                    entry=entry,
-                                    message=f"Error: {str(e)}",
-                                    message_type="error")
+    return redirect(f"/view/{id}")
 
 @app.route("/delete/<int:id>")
-def delete(id):
+def delete_entry(id):
     if not session.get("user"):
         return redirect("/")
     
     db = get_db()
     
-    try:
-        # Delete entry (photos will be deleted automatically due to CASCADE)
-        db.execute("DELETE FROM entries WHERE id = ? AND user_id = ?", 
-                  (id, session["user_id"]))
-        db.commit()
-        
-        return redirect("/entries")
+    # Delete entry (photos will be deleted automatically due to CASCADE)
+    db.execute(
+        "DELETE FROM entries WHERE id = ? AND user_id = ?",
+        (id, session["user_id"])
+    )
+    db.commit()
     
-    except Exception as e:
-        return redirect("/entries")
+    return redirect("/entries")
 
 @app.route("/uploads/<filename>")
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
+# ---------------- RUN APP ----------------
+
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
